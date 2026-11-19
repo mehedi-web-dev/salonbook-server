@@ -8,8 +8,10 @@ import { auth } from "./config/auth.js";
 import healthRouter from "./routes/health.js";
 import servicesRouter from "./routes/services.js";
 import appointmentsRouter from "./routes/appointments.js";
+import paymentsRouter from "./routes/payments.js";
 import uploadsRouter from "./routes/uploads.js";
 import testAuthRouter from "./routes/testAuth.js";
+import { handleStripeWebhook } from "./controllers/paymentController.js";
 import { notFoundHandler, errorHandler } from "./middleware/errorHandler.js";
 
 const app = express();
@@ -67,6 +69,13 @@ app.use(async (req, res, next) => {
 // Better Auth Express handler (MUST be mounted before express.json() body parser)
 app.all("/api/auth/{*splat}", toNodeHandler(auth));
 
+// Stripe Webhook (MUST be mounted before express.json() to preserve raw Buffer body for signature verification)
+app.post(
+  "/api/payments/webhook",
+  express.raw({ type: "application/json" }),
+  handleStripeWebhook
+);
+
 // Body parsing for standard API routes
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -87,6 +96,7 @@ app.get("/", (req, res) => {
 app.use("/api", healthRouter);
 app.use("/api/services", servicesRouter);
 app.use("/api/appointments", appointmentsRouter);
+app.use("/api/payments", paymentsRouter);
 app.use("/api/uploads", uploadsRouter);
 app.use("/api/test", testAuthRouter);
 
