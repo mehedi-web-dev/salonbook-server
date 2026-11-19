@@ -1,8 +1,71 @@
 import { ObjectId } from "mongodb";
 import { db, connectDB } from "../config/db.js";
-import { isValidDateString, isPastDateTime } from "../utils/appointmentValidators.js";
+import { isValidDateString, isPastDateTime, normalizeTimeSlot } from "../utils/appointmentValidators.js";
 
 let indexesInitialized = false;
+
+/**
+ * Safely migrates existing appointment records with non-canonical time slots to canonical 24-hour 'HH:mm' format.
+ * Prevents silent data loss or overwrites by validating conflicts prior to updating.
+ */
+export const migrateAppointmentTimeSlots = async (collection) => {
+  try {
+    const canonicalRegex = /^([01]\d|2[0-3]):[0-5]\d$/;
+    const unnormalizedDocs = await collection
+      .find({ timeSlot: { $not: canonicalRegex } })
+      .toArray();
+
+    if (unnormalizedDocs.length === 0) {
+      return { scanned: 0, updated: 0, conflicts: 0 };
+    }
+
+    let updated = 0;
+    let conflicts = 0;
+
+    for (const doc of unnormalizedDocs) {
+      const normalized = normalizeTimeSlot(doc.timeSlot);
+      if (!normalized) {
+        console.warn(`[TimeSlot Migration] Warning: Cannot normalize invalid timeSlot '${doc.timeSlot}' on doc ${doc._id}`);
+        continue;
+      }
+
+      // Check if another active booking already occupies this normalized slot
+      if (doc.status === "pending" || doc.status === "confirmed") {
+        const existingConflict = await collection.findOne({
+          _id: { $ne: doc._id },
+          appointmentDate: doc.appointmentDate,
+          timeSlot: normalized,
+          status: { $in: ["pending", "confirmed"] },
+        });
+
+        if (existingConflict) {
+          conflicts++;
+          console.warn(
+            `[TimeSlot Migration] Conflict detected for doc ${doc._id}: normalized slot ${normalized} already active on ${doc.appointmentDate}. Requires manual review.`
+          );
+          continue;
+        }
+      }
+
+      await collection.updateOne(
+        { _id: doc._id },
+        { $set: { timeSlot: normalized } }
+      );
+      updated++;
+    }
+
+    if (updated > 0 || conflicts > 0) {
+      console.log(
+        `[TimeSlot Migration] Migrated ${updated}/${unnormalizedDocs.length} records. Conflicts requiring review: ${conflicts}.`
+      );
+    }
+
+    return { scanned: unnormalizedDocs.length, updated, conflicts };
+  } catch (err) {
+    console.error("[TimeSlot Migration] Migration check error:", err.message);
+    return { error: err.message };
+  }
+};
 
 /**
  * Accesses the appointments collection and initializes required indexes.
@@ -13,10 +76,13 @@ export const getAppointmentsCollection = async () => {
 
   if (!indexesInitialized) {
     try {
+      // First run safe migration for any legacy unnormalized time slots
+      await migrateAppointmentTimeSlots(collection);
+
       await Promise.all([
         // Duplicate active date/time slot prevention:
         // Unique compound partial index over appointmentDate and timeSlot for active (pending / confirmed) bookings.
-        // Cancelled bookings are excluded from the index, immediately releasing the slot.
+        // Operating over canonical 24-hour HH:mm timeSlot strings.
         collection.createIndex(
           { appointmentDate: 1, timeSlot: 1 },
           {
@@ -116,19 +182,26 @@ export const createAppointment = async (req, res, next) => {
       });
     }
 
-    // 4. Validate timeSlot
-    if (!timeSlot || typeof timeSlot !== "string" || timeSlot.trim().length < 2 || timeSlot.trim().length > 50) {
+    // 4. Validate and normalize timeSlot to canonical 24-hour 'HH:mm' format
+    if (!timeSlot || typeof timeSlot !== "string") {
       return res.status(400).json({
         success: false,
-        message: "A valid appointment time slot is required (e.g. '10:00 AM')",
+        message: "A valid appointment time slot is required (e.g. '10:00 AM' or '10:00')",
+      });
+    }
+
+    const normalizedTimeSlot = normalizeTimeSlot(timeSlot);
+    if (!normalizedTimeSlot) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid time slot format. Please provide a valid time (e.g. '10:00 AM' or '10:00')",
       });
     }
 
     const trimmedDate = appointmentDate.trim();
-    const trimmedTimeSlot = timeSlot.trim();
 
     // 5. Reject past appointment dates and times
-    if (isPastDateTime(trimmedDate, trimmedTimeSlot)) {
+    if (isPastDateTime(trimmedDate, normalizedTimeSlot)) {
       return res.status(400).json({
         success: false,
         message: "Appointment date and time cannot be in the past",
@@ -147,10 +220,11 @@ export const createAppointment = async (req, res, next) => {
 
     const appointmentsCollection = await getAppointmentsCollection();
 
-    // 7. Concurrency-safe slot pre-check: verify if an active appointment already occupies this slot
+    // 7. Concurrency-safe slot pre-check using canonical 24-hour timeSlot:
+    // Verify if an active appointment already occupies this normalized slot
     const existingBooking = await appointmentsCollection.findOne({
       appointmentDate: trimmedDate,
-      timeSlot: trimmedTimeSlot,
+      timeSlot: normalizedTimeSlot,
       status: { $in: ["pending", "confirmed"] },
     });
 
@@ -161,13 +235,13 @@ export const createAppointment = async (req, res, next) => {
       });
     }
 
-    // 8. Construct immutable appointment record on the server
+    // 8. Construct immutable appointment record on the server storing canonical timeSlot
     const now = new Date();
     const appointmentDoc = {
       serviceId: new ObjectId(serviceId),
       customerId: new ObjectId(req.user.id),
       appointmentDate: trimmedDate,
-      timeSlot: trimmedTimeSlot,
+      timeSlot: normalizedTimeSlot, // Stored strictly as canonical 24-hour 'HH:mm'
       message: message && typeof message === "string" ? message.trim() : "",
       servicePrice: service.price, // Trust ONLY database price
       paymentStatus: "unpaid",     // Initial status is strictly unpaid
@@ -440,7 +514,7 @@ export const cancelMyAppointment = async (req, res, next) => {
 export const getAllAppointments = async (req, res, next) => {
   try {
     const appointmentsCollection = await getAppointmentsCollection();
-    const { page, limit, status, paymentStatus, appointmentDate, customerId } = req.query;
+    const { page, limit, status, paymentStatus, appointmentDate, customerId, timeSlot } = req.query;
 
     const pageNum = Math.max(1, parseInt(page, 10) || 1);
     const limitNum = Math.min(100, Math.max(1, parseInt(limit, 10) || 10));
@@ -467,6 +541,14 @@ export const getAllAppointments = async (req, res, next) => {
     // Filter by appointmentDate
     if (appointmentDate && typeof appointmentDate === "string" && isValidDateString(appointmentDate)) {
       filter.appointmentDate = appointmentDate.trim();
+    }
+
+    // Filter by normalized timeSlot
+    if (timeSlot && typeof timeSlot === "string") {
+      const normalizedSlot = normalizeTimeSlot(timeSlot);
+      if (normalizedSlot) {
+        filter.timeSlot = normalizedSlot;
+      }
     }
 
     // Filter by customerId

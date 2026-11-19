@@ -21,45 +21,75 @@ export const isValidDateString = (dateStr) => {
 };
 
 /**
- * Parses common 12-hour or 24-hour time slots into { hours, minutes }
- * Supports: "10:00 AM", "2:30 PM", "14:00", "10:00 - 11:00 AM"
+ * Parses common 12-hour or 24-hour time slots into { hours, minutes }.
+ * Supports: "10:00 AM", "2:30 PM", "02:30 PM", "14:00", "10:00 - 11:00 AM".
+ * Rejects invalid hours (e.g. 14:00 PM, 25:00) and invalid minutes.
  */
 export const parseTimeSlot = (slotStr) => {
   if (!slotStr || typeof slotStr !== "string") return null;
 
-  // If slot has a range (e.g. "10:00 AM - 11:00 AM"), extract start time
-  const rawStartTime = slotStr.includes("-") ? slotStr.split("-")[0].trim() : slotStr.trim();
+  const trimmed = slotStr.trim();
+  if (trimmed.length < 3 || trimmed.length > 50) return null;
 
-  // Check 12-hour format e.g. "10:00 AM", "2:30 pm", "10:00am"
-  const match12 = rawStartTime.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
-  if (match12) {
-    let hours = parseInt(match12[1], 10);
-    const minutes = parseInt(match12[2], 10);
-    const meridiem = (match12[3] || "").toUpperCase();
+  // If slot has a range (e.g. "10:00 AM - 11:00 AM" or "10:00 - 11:00"), extract start time
+  const rawStartTime = trimmed.includes("-") ? trimmed.split("-")[0].trim() : trimmed;
 
-    // Also check if meridiem was at the end of the full slot (e.g. "10:00 - 11:00 AM")
-    const fullMeridiemMatch = slotStr.match(/\b(AM|PM)\b/i);
-    const effectiveMeridiem = meridiem || (fullMeridiemMatch ? fullMeridiemMatch[1].toUpperCase() : "");
+  // Check if meridiem (AM/PM) was specified at the end of the full range: "10:00 - 11:00 AM"
+  const rangeMeridiemMatch = trimmed.includes("-") ? trimmed.match(/\b(AM|PM)\b/i) : null;
 
-    if (effectiveMeridiem === "PM" && hours < 12) hours += 12;
-    if (effectiveMeridiem === "AM" && hours === 12) hours = 0;
+  // 1. Check 12-hour format e.g. "10:00 AM", "2:30 pm", "02:30 PM"
+  const match12 = rawStartTime.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (match12 || (rangeMeridiemMatch && rawStartTime.match(/^(\d{1,2}):(\d{2})$/))) {
+    const timeMatch = match12 || rawStartTime.match(/^(\d{1,2}):(\d{2})$/);
+    const rawHours = parseInt(timeMatch[1], 10);
+    const minutes = parseInt(timeMatch[2], 10);
+    const meridiem = (match12 ? match12[3] : rangeMeridiemMatch[1]).toUpperCase();
 
-    if (hours >= 0 && hours < 24 && minutes >= 0 && minutes < 60) {
-      return { hours, minutes };
+    // In 12-hour format, hours must be between 1 and 12, minutes 0 to 59
+    if (rawHours < 1 || rawHours > 12 || minutes < 0 || minutes > 59) {
+      return null;
     }
+
+    let hours = rawHours;
+    if (meridiem === "PM" && hours < 12) hours += 12;
+    if (meridiem === "AM" && hours === 12) hours = 0;
+
+    return { hours, minutes };
   }
 
-  // Check 24-hour format e.g. "14:30"
+  // 2. Check 24-hour format e.g. "00:00" to "23:59", "10:00", "14:30"
   const match24 = rawStartTime.match(/^(\d{1,2}):(\d{2})$/);
   if (match24) {
     const hours = parseInt(match24[1], 10);
     const minutes = parseInt(match24[2], 10);
-    if (hours >= 0 && hours < 24 && minutes >= 0 && minutes < 60) {
+
+    if (hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59) {
       return { hours, minutes };
     }
   }
 
   return null;
+};
+
+/**
+ * Normalizes any valid 12-hour or 24-hour time input into canonical 24-hour 'HH:mm' format.
+ * Returns null if the input cannot be parsed into a valid time.
+ * Examples:
+ *   "10:00 AM" -> "10:00"
+ *   "10:00"    -> "10:00"
+ *   "02:30 PM" -> "14:30"
+ *   "2:30 PM"  -> "14:30"
+ *   "14:30"    -> "14:30"
+ *   "12:00 AM" -> "00:00"
+ *   "12:00 PM" -> "12:00"
+ */
+export const normalizeTimeSlot = (slotStr) => {
+  const parsed = parseTimeSlot(slotStr);
+  if (!parsed) return null;
+
+  const hh = String(parsed.hours).padStart(2, "0");
+  const mm = String(parsed.minutes).padStart(2, "0");
+  return `${hh}:${mm}`;
 };
 
 /**
