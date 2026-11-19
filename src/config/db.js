@@ -1,16 +1,18 @@
-import mongoose from "mongoose";
+import { MongoClient, ServerApiVersion } from "mongodb";
 
-/**
- * Global cache object across hot reloads in development
- * and function invocations in serverless environments (e.g. Vercel).
- */
-let cached = global.mongoose;
+const options = {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
+  maxPoolSize: 10,
+  serverSelectionTimeoutMS: 5000,
+};
 
-if (!cached) {
-  cached = global.mongoose = { conn: null, promise: null };
-}
+let client;
 
-export const connectDB = async () => {
+const getClientPromise = () => {
   const uri = process.env.MONGODB_URI;
 
   if (!uri) {
@@ -19,36 +21,43 @@ export const connectDB = async () => {
     );
   }
 
-  if (cached.conn) {
-    return cached.conn;
+  if (!global._mongoClientPromise) {
+    client = new MongoClient(uri, options);
+    global._mongoClientPromise = client.connect().catch((err) => {
+      global._mongoClientPromise = null;
+      console.error("MongoDB connection failed:", err.message);
+      throw err;
+    });
   }
 
-  if (!cached.promise) {
-    const opts = {
-      bufferCommands: false,
-      maxPoolSize: 10,
-      serverSelectionTimeoutMS: 5000,
-    };
-
-    cached.promise = mongoose
-      .connect(uri, opts)
-      .then((mongooseInstance) => {
-        console.log("MongoDB connected successfully");
-        return mongooseInstance;
-      })
-      .catch((err) => {
-        cached.promise = null;
-        console.error("MongoDB connection failed:", err.message);
-        throw err;
-      });
-  }
-
-  try {
-    cached.conn = await cached.promise;
-  } catch (error) {
-    cached.promise = null;
-    throw error;
-  }
-
-  return cached.conn;
+  return global._mongoClientPromise;
 };
+
+/**
+ * Connect to MongoDB and return the connected MongoClient instance.
+ * Reuses existing connection promise across serverless function invocations.
+ */
+export const connectDB = async () => {
+  return await getClientPromise();
+};
+
+/**
+ * Return a MongoDB Database instance.
+ * @param {string} [dbName="salonbook"]
+ */
+export const getDB = async (dbName = "salonbook") => {
+  const connectedClient = await connectDB();
+  return connectedClient.db(dbName);
+};
+
+/**
+ * Return a specific MongoDB Collection instance.
+ * @param {string} collectionName
+ * @param {string} [dbName="salonbook"]
+ */
+export const getCollection = async (collectionName, dbName = "salonbook") => {
+  const db = await getDB(dbName);
+  return db.collection(collectionName);
+};
+
+export default connectDB;
