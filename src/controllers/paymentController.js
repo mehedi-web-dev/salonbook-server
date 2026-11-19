@@ -6,9 +6,30 @@ import {
   getStripeCurrency,
   getFrontendUrl,
   formatStripeAmount,
+  parseStripeAmount,
 } from "../config/stripe.js";
 
 let indexesInitialized = false;
+
+/**
+ * Accesses the webhook_events collection and initializes its indexes for event-level idempotency.
+ */
+export const getWebhookEventsCollection = async () => {
+  await connectDB();
+  const collection = db.collection("webhook_events");
+  try {
+    // TTL index: keep processed webhook event IDs for 30 days
+    await collection.createIndex(
+      { createdAt: 1 },
+      { expireAfterSeconds: 60 * 60 * 24 * 30, name: "idx_webhook_events_ttl" }
+    );
+  } catch (err) {
+    if (err.code !== 85) {
+      console.warn("[WebhookEvents Collection] Index notice:", err.message);
+    }
+  }
+  return collection;
+};
 
 /**
  * Accesses the transactions collection and ensures unique indexes exist.
@@ -35,12 +56,13 @@ export const getTransactionsCollection = async () => {
           { appointmentId: 1 },
           { name: "idx_appointment_id" }
         ),
-        // Sparse index on Stripe Event ID for webhook idempotency
+        // Sparse index on Stripe Event ID for webhook event lookup
         collection.createIndex(
           { stripeEventId: 1 },
           { sparse: true, name: "idx_stripe_event_id" }
         ),
       ]);
+      await getWebhookEventsCollection();
       indexesInitialized = true;
     } catch (err) {
       if (err.code !== 85) {
@@ -128,7 +150,7 @@ export const createCheckoutSession = async (req, res, next) => {
     // Retrieve service details for line item metadata
     const service = await db.collection("services").findOne({ _id: appointment.serviceId });
 
-    // Derive amount and currency strictly from server-side appointment servicePrice
+    // Derive amount and currency strictly from server-side appointment servicePrice and server config
     const currency = getStripeCurrency();
     const unitAmount = formatStripeAmount(appointment.servicePrice, currency);
 
@@ -265,11 +287,12 @@ export const handleStripeWebhook = async (req, res, next) => {
     }
 
     const transactionsCollection = await getTransactionsCollection();
+    const webhookEventsCollection = await getWebhookEventsCollection();
 
-    // Event-level idempotency: check if event was already processed
+    // Event-level idempotency pre-check
     if (event.id) {
-      const existingTx = await transactionsCollection.findOne({ stripeEventId: event.id });
-      if (existingTx) {
+      const existingEvent = await webhookEventsCollection.findOne({ _id: event.id });
+      if (existingEvent) {
         return res.status(200).json({
           received: true,
           message: "Event already processed",
@@ -324,28 +347,71 @@ export const handleStripeWebhook = async (req, res, next) => {
         });
       }
 
-      // Verify amount
-      const currency = session.currency || "usd";
-      const expectedAmount = formatStripeAmount(appointment.servicePrice, currency);
+      // 1. Verify currency strictly against server-side configured currency
+      const configuredCurrency = getStripeCurrency().toLowerCase();
+      const sessionCurrency = (session.currency || "").toLowerCase();
+
+      if (sessionCurrency !== configuredCurrency) {
+        console.error(
+          `[Stripe Webhook] Currency mismatch: expected ${configuredCurrency}, received ${sessionCurrency}`
+        );
+        // Record reconciliation transaction without marking appointment paid
+        await transactionsCollection.updateOne(
+          { stripeSessionId: session.id },
+          {
+            $set: {
+              appointmentId: appointment._id,
+              customerId: appointment.customerId,
+              stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
+              stripeEventId: event.id,
+              amount: session.amount_total ? parseStripeAmount(session.amount_total, sessionCurrency) : appointment.servicePrice,
+              currency: sessionCurrency || configuredCurrency,
+              status: "reconciliation_required",
+              paymentMethod: session.payment_method_types?.[0] || "card",
+              notes: `Currency mismatch: expected ${configuredCurrency}, received ${sessionCurrency}`,
+              updatedAt: new Date(),
+            },
+            $setOnInsert: {
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        ).catch(() => {});
+
+        return res.status(400).json({
+          success: false,
+          message: "Currency mismatch detected",
+        });
+      }
+
+      // 2. Verify amount strictly against server-side appointment price in configured currency
+      const expectedAmount = formatStripeAmount(appointment.servicePrice, configuredCurrency);
       if (session.amount_total !== expectedAmount) {
         console.error(
           `[Stripe Webhook] Amount mismatch: expected ${expectedAmount}, received ${session.amount_total}`
         );
         // Record reconciliation transaction without marking appointment paid
-        await transactionsCollection.insertOne({
-          appointmentId: appointment._id,
-          customerId: appointment.customerId,
-          stripeSessionId: session.id,
-          stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
-          stripeEventId: event.id,
-          amount: session.amount_total ? session.amount_total / 100 : appointment.servicePrice,
-          currency,
-          status: "reconciliation_required",
-          paymentMethod: session.payment_method_types?.[0] || "card",
-          notes: "Amount mismatch detected during webhook verification.",
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        }).catch(() => {});
+        await transactionsCollection.updateOne(
+          { stripeSessionId: session.id },
+          {
+            $set: {
+              appointmentId: appointment._id,
+              customerId: appointment.customerId,
+              stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
+              stripeEventId: event.id,
+              amount: session.amount_total ? parseStripeAmount(session.amount_total, sessionCurrency) : appointment.servicePrice,
+              currency: sessionCurrency,
+              status: "reconciliation_required",
+              paymentMethod: session.payment_method_types?.[0] || "card",
+              notes: `Amount mismatch: expected ${expectedAmount}, received ${session.amount_total}`,
+              updatedAt: new Date(),
+            },
+            $setOnInsert: {
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        ).catch(() => {});
 
         return res.status(400).json({
           success: false,
@@ -353,33 +419,32 @@ export const handleStripeWebhook = async (req, res, next) => {
         });
       }
 
-      // Check if already paid (idempotency check on appointment document)
-      if (appointment.paymentStatus === "paid") {
-        return res.status(200).json({
-          received: true,
-          message: "Appointment is already marked as paid",
-        });
-      }
-
-      // Edge case: Appointment was cancelled while Checkout Session was open
+      // 3. Edge case: Appointment was cancelled while Checkout Session was open
       if (appointment.status === "cancelled") {
         console.warn(
           `[Stripe Webhook] Payment received for cancelled appointment ${appointment._id}. Recording reconciliation transaction.`
         );
-        await transactionsCollection.insertOne({
-          appointmentId: appointment._id,
-          customerId: appointment.customerId,
-          stripeSessionId: session.id,
-          stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
-          stripeEventId: event.id,
-          amount: appointment.servicePrice,
-          currency,
-          status: "reconciliation_required",
-          paymentMethod: session.payment_method_types?.[0] || "card",
-          notes: "Payment received after appointment was cancelled. Requires refund or manual rescheduling.",
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        }).catch(() => {});
+        await transactionsCollection.updateOne(
+          { stripeSessionId: session.id },
+          {
+            $set: {
+              appointmentId: appointment._id,
+              customerId: appointment.customerId,
+              stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
+              stripeEventId: event.id,
+              amount: appointment.servicePrice,
+              currency: configuredCurrency,
+              status: "reconciliation_required",
+              paymentMethod: session.payment_method_types?.[0] || "card",
+              notes: "Payment received after appointment was cancelled. Requires refund or manual rescheduling.",
+              updatedAt: new Date(),
+            },
+            $setOnInsert: {
+              createdAt: new Date(),
+            },
+          },
+          { upsert: true }
+        ).catch(() => {});
 
         return res.status(200).json({
           received: true,
@@ -388,51 +453,103 @@ export const handleStripeWebhook = async (req, res, next) => {
         });
       }
 
-      // Standard path: Execute atomic MongoDB transaction for appointment status update + transaction record
+      // Check if already paid (session-level check)
+      const existingSessionTx = await transactionsCollection.findOne({ stripeSessionId: session.id });
+      if (existingSessionTx && existingSessionTx.status === "paid" && appointment.paymentStatus === "paid") {
+        return res.status(200).json({
+          received: true,
+          message: "Transaction already completed",
+        });
+      }
+
+      // Execute atomic MongoDB transaction to update appointment and create/transition transaction record
       const mongoSession = client.startSession();
       try {
         await mongoSession.withTransaction(async () => {
-          // Atomically update appointment paymentStatus from 'unpaid' to 'paid'
-          const updateResult = await appointmentsCollection.updateOne(
-            { _id: appointment._id, paymentStatus: "unpaid" },
+          // Record event in webhook_events collection for concurrency-safe event idempotency
+          await webhookEventsCollection.insertOne(
             {
-              $set: {
-                paymentStatus: "paid",
-                updatedAt: new Date(),
-              },
+              _id: event.id,
+              type: event.type,
+              sessionId: session.id,
+              createdAt: new Date(),
             },
             { session: mongoSession }
           );
 
-          if (updateResult.modifiedCount === 0) {
-            throw new Error("Appointment was concurrently marked as paid");
+          // Update appointment paymentStatus from 'unpaid' to 'paid'
+          if (appointment.paymentStatus !== "paid") {
+            const updateResult = await appointmentsCollection.updateOne(
+              { _id: appointment._id, paymentStatus: "unpaid" },
+              {
+                $set: {
+                  paymentStatus: "paid",
+                  updatedAt: new Date(),
+                },
+              },
+              { session: mongoSession }
+            );
+
+            if (updateResult.modifiedCount === 0) {
+              throw new Error("Appointment was concurrently marked as paid");
+            }
           }
 
-          // Insert immutable transaction record
-          await transactionsCollection.insertOne(
-            {
-              appointmentId: appointment._id,
-              customerId: appointment.customerId,
-              stripeSessionId: session.id,
-              stripePaymentIntentId:
-                typeof session.payment_intent === "string" ? session.payment_intent : null,
-              stripeEventId: event.id,
-              amount: appointment.servicePrice,
-              currency,
-              status: "paid",
-              paymentMethod: session.payment_method_types?.[0] || "card",
-              createdAt: new Date(),
-              updatedAt: new Date(),
-            },
-            { session: mongoSession }
-          );
+          // Transition previous failed transaction or create new paid transaction
+          if (existingSessionTx && existingSessionTx.status === "failed") {
+            // Previous payment attempt failed, but retry has now succeeded!
+            await transactionsCollection.updateOne(
+              { _id: existingSessionTx._id },
+              {
+                $set: {
+                  status: "paid",
+                  stripeEventId: event.id,
+                  stripePaymentIntentId:
+                    typeof session.payment_intent === "string"
+                      ? session.payment_intent
+                      : existingSessionTx.stripePaymentIntentId,
+                  amount: appointment.servicePrice,
+                  currency: configuredCurrency,
+                  paymentMethod: session.payment_method_types?.[0] || existingSessionTx.paymentMethod || "card",
+                  updatedAt: new Date(),
+                },
+                $push: {
+                  attempts: {
+                    status: "failed",
+                    eventId: existingSessionTx.stripeEventId,
+                    timestamp: existingSessionTx.updatedAt || existingSessionTx.createdAt,
+                  },
+                },
+              },
+              { session: mongoSession }
+            );
+          } else if (!existingSessionTx) {
+            // New successful transaction record
+            await transactionsCollection.insertOne(
+              {
+                appointmentId: appointment._id,
+                customerId: appointment.customerId,
+                stripeSessionId: session.id,
+                stripePaymentIntentId:
+                  typeof session.payment_intent === "string" ? session.payment_intent : null,
+                stripeEventId: event.id,
+                amount: appointment.servicePrice,
+                currency: configuredCurrency,
+                status: "paid",
+                paymentMethod: session.payment_method_types?.[0] || "card",
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+              { session: mongoSession }
+            );
+          }
         });
       } catch (txError) {
-        // If unique index collision occurred on stripeSessionId, the payment was already recorded
-        if (txError.code === 11000) {
+        // Handle duplicate key error gracefully (concurrent identical event delivery)
+        if (txError.code === 11000 || txError.message?.includes("concurrently marked as paid")) {
           return res.status(200).json({
             received: true,
-            message: "Transaction already exists",
+            message: "Event or transaction already processed",
           });
         }
         throw txError;
@@ -452,21 +569,61 @@ export const handleStripeWebhook = async (req, res, next) => {
       const appointmentId = session.metadata?.appointmentId;
       const customerId = session.metadata?.customerId;
 
-      if (appointmentId && ObjectId.isValid(appointmentId)) {
-        await transactionsCollection.insertOne({
-          appointmentId: new ObjectId(appointmentId),
-          customerId: customerId && ObjectId.isValid(customerId) ? new ObjectId(customerId) : null,
-          stripeSessionId: session.id,
-          stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
-          stripeEventId: event.id,
-          amount: Number(session.metadata?.servicePrice) || 0,
-          currency: session.currency || "usd",
-          status: "failed",
-          paymentMethod: session.payment_method_types?.[0] || "card",
-          notes: "Asynchronous payment failed at checkout.",
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        }).catch(() => {});
+      // Event idempotency check
+      const eventRecorded = await webhookEventsCollection.findOne({ _id: event.id });
+      if (eventRecorded) {
+        return res.status(200).json({ received: true, message: "Event already processed" });
+      }
+
+      // Check if this session was already paid (do NOT degrade a paid transaction to failed)
+      const existingSessionTx = await transactionsCollection.findOne({ stripeSessionId: session.id });
+      if (existingSessionTx && existingSessionTx.status === "paid") {
+        return res.status(200).json({
+          received: true,
+          message: "Payment already completed successfully; ignoring stale failure event",
+        });
+      }
+
+      const mongoSession = client.startSession();
+      try {
+        await mongoSession.withTransaction(async () => {
+          await webhookEventsCollection.insertOne(
+            {
+              _id: event.id,
+              type: event.type,
+              sessionId: session.id,
+              createdAt: new Date(),
+            },
+            { session: mongoSession }
+          );
+
+          if (!existingSessionTx && appointmentId && ObjectId.isValid(appointmentId)) {
+            await transactionsCollection.insertOne(
+              {
+                appointmentId: new ObjectId(appointmentId),
+                customerId: customerId && ObjectId.isValid(customerId) ? new ObjectId(customerId) : null,
+                stripeSessionId: session.id,
+                stripePaymentIntentId:
+                  typeof session.payment_intent === "string" ? session.payment_intent : null,
+                stripeEventId: event.id,
+                amount: Number(session.metadata?.servicePrice) || 0,
+                currency: session.currency || "usd",
+                status: "failed",
+                paymentMethod: session.payment_method_types?.[0] || "card",
+                notes: "Asynchronous payment failed at checkout.",
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+              { session: mongoSession }
+            );
+          }
+        });
+      } catch (err) {
+        if (err.code !== 11000) {
+          console.error("[Stripe Webhook] Async failure recording error:", err.message);
+        }
+      } finally {
+        await mongoSession.endSession();
       }
 
       return res.status(200).json({
