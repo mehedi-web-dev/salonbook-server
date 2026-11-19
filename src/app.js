@@ -6,6 +6,7 @@ import { toNodeHandler } from "better-auth/node";
 import { connectDB } from "./config/db.js";
 import { auth } from "./config/auth.js";
 import healthRouter from "./routes/health.js";
+import servicesRouter from "./routes/services.js";
 import testAuthRouter from "./routes/testAuth.js";
 import { notFoundHandler, errorHandler } from "./middleware/errorHandler.js";
 
@@ -82,6 +83,7 @@ app.get("/", (req, res) => {
 
 // API Routes
 app.use("/api", healthRouter);
+app.use("/api/services", servicesRouter);
 app.use("/api/test", testAuthRouter);
 
 // 404 and Error Handling
