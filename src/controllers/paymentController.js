@@ -239,6 +239,69 @@ export const createCheckoutSession = async (req, res, next) => {
 };
 
 /**
+ * Helper to record a durable reconciliation transaction and webhook event atomically.
+ * Throws on database failure so caller can return 500 to allow Stripe retries.
+ */
+const recordDurableReconciliation = async ({
+  event,
+  session,
+  appointment,
+  amount,
+  currency,
+  notes,
+  webhookEventsCollection,
+  transactionsCollection,
+}) => {
+  const mongoSession = client.startSession();
+  try {
+    await mongoSession.withTransaction(async () => {
+      await webhookEventsCollection.insertOne(
+        {
+          _id: event.id,
+          type: event.type,
+          sessionId: session.id,
+          reconciliation: true,
+          createdAt: new Date(),
+        },
+        { session: mongoSession }
+      );
+
+      await transactionsCollection.updateOne(
+        { stripeSessionId: session.id },
+        {
+          $set: {
+            appointmentId: appointment._id,
+            customerId: appointment.customerId,
+            stripePaymentIntentId:
+              typeof session.payment_intent === "string" ? session.payment_intent : null,
+            stripeEventId: event.id,
+            amount,
+            currency,
+            status: "reconciliation_required",
+            paymentMethod: session.payment_method_types?.[0] || "card",
+            notes,
+            updatedAt: new Date(),
+          },
+          $setOnInsert: {
+            createdAt: new Date(),
+          },
+        },
+        { session: mongoSession, upsert: true }
+      );
+    });
+  } catch (dbErr) {
+    if (dbErr.code === 11000) {
+      return { duplicate: true };
+    }
+    console.error("[Stripe Webhook] Database failure during reconciliation recording:", dbErr.message);
+    throw dbErr;
+  } finally {
+    await mongoSession.endSession();
+  }
+  return { duplicate: false };
+};
+
+/**
  * POST /api/payments/webhook
  * Receives Stripe webhook events with raw body signature verification and atomic state updates.
  */
@@ -295,6 +358,7 @@ export const handleStripeWebhook = async (req, res, next) => {
       if (existingEvent) {
         return res.status(200).json({
           received: true,
+          reconciliation: Boolean(existingEvent.reconciliation),
           message: "Event already processed",
         });
       }
@@ -355,32 +419,25 @@ export const handleStripeWebhook = async (req, res, next) => {
         console.error(
           `[Stripe Webhook] Currency mismatch: expected ${configuredCurrency}, received ${sessionCurrency}`
         );
-        // Record reconciliation transaction without marking appointment paid
-        await transactionsCollection.updateOne(
-          { stripeSessionId: session.id },
-          {
-            $set: {
-              appointmentId: appointment._id,
-              customerId: appointment.customerId,
-              stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
-              stripeEventId: event.id,
-              amount: session.amount_total ? parseStripeAmount(session.amount_total, sessionCurrency) : appointment.servicePrice,
-              currency: sessionCurrency || configuredCurrency,
-              status: "reconciliation_required",
-              paymentMethod: session.payment_method_types?.[0] || "card",
-              notes: `Currency mismatch: expected ${configuredCurrency}, received ${sessionCurrency}`,
-              updatedAt: new Date(),
-            },
-            $setOnInsert: {
-              createdAt: new Date(),
-            },
-          },
-          { upsert: true }
-        ).catch(() => {});
+        const amount = session.amount_total
+          ? parseStripeAmount(session.amount_total, sessionCurrency)
+          : appointment.servicePrice;
+        await recordDurableReconciliation({
+          event,
+          session,
+          appointment,
+          amount,
+          currency: sessionCurrency || configuredCurrency,
+          notes: `Currency mismatch: expected ${configuredCurrency}, received ${sessionCurrency}`,
+          webhookEventsCollection,
+          transactionsCollection,
+        });
 
-        return res.status(400).json({
-          success: false,
-          message: "Currency mismatch detected",
+        return res.status(200).json({
+          received: true,
+          reconciliation: true,
+          status: "reconciliation_required",
+          message: "Currency mismatch recorded for reconciliation",
         });
       }
 
@@ -390,32 +447,25 @@ export const handleStripeWebhook = async (req, res, next) => {
         console.error(
           `[Stripe Webhook] Amount mismatch: expected ${expectedAmount}, received ${session.amount_total}`
         );
-        // Record reconciliation transaction without marking appointment paid
-        await transactionsCollection.updateOne(
-          { stripeSessionId: session.id },
-          {
-            $set: {
-              appointmentId: appointment._id,
-              customerId: appointment.customerId,
-              stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
-              stripeEventId: event.id,
-              amount: session.amount_total ? parseStripeAmount(session.amount_total, sessionCurrency) : appointment.servicePrice,
-              currency: sessionCurrency,
-              status: "reconciliation_required",
-              paymentMethod: session.payment_method_types?.[0] || "card",
-              notes: `Amount mismatch: expected ${expectedAmount}, received ${session.amount_total}`,
-              updatedAt: new Date(),
-            },
-            $setOnInsert: {
-              createdAt: new Date(),
-            },
-          },
-          { upsert: true }
-        ).catch(() => {});
+        const amount = session.amount_total
+          ? parseStripeAmount(session.amount_total, sessionCurrency)
+          : appointment.servicePrice;
+        await recordDurableReconciliation({
+          event,
+          session,
+          appointment,
+          amount,
+          currency: sessionCurrency || configuredCurrency,
+          notes: `Amount mismatch: expected ${expectedAmount}, received ${session.amount_total}`,
+          webhookEventsCollection,
+          transactionsCollection,
+        });
 
-        return res.status(400).json({
-          success: false,
-          message: "Amount mismatch detected",
+        return res.status(200).json({
+          received: true,
+          reconciliation: true,
+          status: "reconciliation_required",
+          message: "Amount mismatch recorded for reconciliation",
         });
       }
 
@@ -424,41 +474,41 @@ export const handleStripeWebhook = async (req, res, next) => {
         console.warn(
           `[Stripe Webhook] Payment received for cancelled appointment ${appointment._id}. Recording reconciliation transaction.`
         );
-        await transactionsCollection.updateOne(
-          { stripeSessionId: session.id },
-          {
-            $set: {
-              appointmentId: appointment._id,
-              customerId: appointment.customerId,
-              stripePaymentIntentId: typeof session.payment_intent === "string" ? session.payment_intent : null,
-              stripeEventId: event.id,
-              amount: appointment.servicePrice,
-              currency: configuredCurrency,
-              status: "reconciliation_required",
-              paymentMethod: session.payment_method_types?.[0] || "card",
-              notes: "Payment received after appointment was cancelled. Requires refund or manual rescheduling.",
-              updatedAt: new Date(),
-            },
-            $setOnInsert: {
-              createdAt: new Date(),
-            },
-          },
-          { upsert: true }
-        ).catch(() => {});
+        await recordDurableReconciliation({
+          event,
+          session,
+          appointment,
+          amount: appointment.servicePrice,
+          currency: configuredCurrency,
+          notes: "Payment received after appointment was cancelled. Requires refund or manual rescheduling.",
+          webhookEventsCollection,
+          transactionsCollection,
+        });
 
         return res.status(200).json({
           received: true,
           reconciliation: true,
+          status: "reconciliation_required",
           message: "Payment recorded for cancelled appointment; requires manual reconciliation",
         });
       }
 
-      // Check if already paid (session-level check)
+      // Check if session is already recorded in transactions
       const existingSessionTx = await transactionsCollection.findOne({ stripeSessionId: session.id });
       if (existingSessionTx && existingSessionTx.status === "paid" && appointment.paymentStatus === "paid") {
         return res.status(200).json({
           received: true,
           message: "Transaction already completed",
+        });
+      }
+
+      // If session is already in reconciliation_required, DO NOT automatically transition to paid!
+      if (existingSessionTx && existingSessionTx.status === "reconciliation_required") {
+        return res.status(200).json({
+          received: true,
+          reconciliation: true,
+          status: "reconciliation_required",
+          message: "Transaction remains in reconciliation; administrative resolution required",
         });
       }
 
@@ -584,6 +634,16 @@ export const handleStripeWebhook = async (req, res, next) => {
         });
       }
 
+      // Check if this session is in reconciliation_required (do NOT degrade or modify reconciliation state)
+      if (existingSessionTx && existingSessionTx.status === "reconciliation_required") {
+        return res.status(200).json({
+          received: true,
+          reconciliation: true,
+          status: "reconciliation_required",
+          message: "Transaction remains in reconciliation; ignoring failure event",
+        });
+      }
+
       const mongoSession = client.startSession();
       try {
         await mongoSession.withTransaction(async () => {
@@ -621,6 +681,7 @@ export const handleStripeWebhook = async (req, res, next) => {
       } catch (err) {
         if (err.code !== 11000) {
           console.error("[Stripe Webhook] Async failure recording error:", err.message);
+          throw err;
         }
       } finally {
         await mongoSession.endSession();
