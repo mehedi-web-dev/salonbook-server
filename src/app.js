@@ -10,6 +10,7 @@ import servicesRouter from "./routes/services.js";
 import appointmentsRouter from "./routes/appointments.js";
 import paymentsRouter from "./routes/payments.js";
 import adminRouter from "./routes/admin.js";
+import profileRouter from "./routes/profile.js";
 import uploadsRouter from "./routes/uploads.js";
 import testAuthRouter from "./routes/testAuth.js";
 import { handleStripeWebhook } from "./controllers/paymentController.js";
@@ -99,6 +100,7 @@ app.use("/api/services", servicesRouter);
 app.use("/api/appointments", appointmentsRouter);
 app.use("/api/payments", paymentsRouter);
 app.use("/api/admin", adminRouter);
+app.use("/api/profile", profileRouter);
 app.use("/api/uploads", uploadsRouter);
 app.use("/api/test", testAuthRouter);
 

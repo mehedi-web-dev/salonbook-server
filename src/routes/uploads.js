@@ -1,7 +1,7 @@
 import express from "express";
-import { requireAdmin } from "../middleware/auth.js";
+import { requireAdmin, requireAuth } from "../middleware/auth.js";
 import { handleImageUpload } from "../middleware/upload.js";
-import { uploadServiceImage } from "../controllers/uploadController.js";
+import { uploadServiceImage, uploadProfileImage } from "../controllers/uploadController.js";
 
 const router = express.Router();
 
@@ -18,6 +18,21 @@ router.post(
   requireAdmin,
   handleImageUpload,
   uploadServiceImage
+);
+
+/**
+ * Authenticated User Profile Image Upload Route
+ * POST /api/uploads/profile-image
+ *
+ * 1. requireAuth: Rejects unauthenticated requests (401) and blocked accounts (403)
+ * 2. handleImageUpload: Validates multipart/form-data payload, file format (JPEG/PNG/WebP), and size (<=5MB)
+ * 3. uploadProfileImage: Uploads file buffer to ImgBB and returns hosted URLs
+ */
+router.post(
+  "/profile-image",
+  requireAuth,
+  handleImageUpload,
+  uploadProfileImage
 );
 
 export default router;
