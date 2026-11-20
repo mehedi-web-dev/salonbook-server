@@ -48,7 +48,7 @@ const corsOptions = {
   credentials: true,
   methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization", "Cookie"],
-  exposedHeaders: ["Set-Cookie"],
+  exposedHeaders: ["Set-Cookie", "set-auth-jwt"],
 };
 
 app.use(cors(corsOptions));
@@ -102,7 +102,9 @@ app.use("/api/payments", paymentsRouter);
 app.use("/api/admin", adminRouter);
 app.use("/api/profile", profileRouter);
 app.use("/api/uploads", uploadsRouter);
-app.use("/api/test", testAuthRouter);
+if (process.env.NODE_ENV !== "production") {
+  app.use("/api/test", testAuthRouter);
+}
 
 // 404 and Error Handling
 app.use(notFoundHandler);

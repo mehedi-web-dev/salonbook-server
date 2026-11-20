@@ -1,5 +1,6 @@
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
+import { jwt } from "better-auth/plugins";
 import { client, db } from "./db.js";
 
 const PRODUCTION_FRONTEND = "https://salonbook-virid.vercel.app";
@@ -15,6 +16,8 @@ const trustedOrigins = [
 if (process.env.CLIENT_URL && !trustedOrigins.includes(process.env.CLIENT_URL)) {
   trustedOrigins.push(process.env.CLIENT_URL);
 }
+
+const frontendOrigin = process.env.CLIENT_URL || PRODUCTION_FRONTEND;
 
 /**
  * Idempotently checks and elevates user to admin role if matching ADMIN_EMAIL
@@ -106,6 +109,28 @@ export const auth = betterAuth({
     window: 60,
     max: 20,
   },
+  plugins: [
+    jwt({
+      jwks: {
+        keyPairConfig: {
+          alg: "EdDSA",
+          crv: "Ed25519",
+        },
+      },
+      jwt: {
+        issuer: process.env.BETTER_AUTH_URL || "http://localhost:5000",
+        audience: frontendOrigin,
+        expirationTime: "15m",
+        definePayload: ({ user }) => ({
+          sub: user.id || (user._id ? user._id.toString() : undefined),
+          email: user.email,
+          name: user.name,
+          role: user.role || "customer",
+          isBlocked: Boolean(user.isBlocked),
+        }),
+      },
+    }),
+  ],
 });
 
 export default auth;
