@@ -33,6 +33,28 @@ const escapeRegex = (str) => {
 };
 
 /**
+ * Formats a service document for API responses, ensuring backward-compatible
+ * exposure of both assignment field names (serviceName, status) and
+ * original field names (name, isActive).
+ */
+export const formatService = (service) => {
+  if (!service || typeof service !== "object") return service;
+  const name = service.name || service.serviceName || "";
+  const isActive = typeof service.isActive === "boolean"
+    ? service.isActive
+    : service.status === "active";
+  const status = isActive ? "active" : "inactive";
+
+  return {
+    ...service,
+    name,
+    serviceName: name,
+    isActive,
+    status,
+  };
+};
+
+/**
  * GET /api/services (Public with optional Admin filtering)
  * Supports search, category filter, price sorting, and pagination.
  */
@@ -56,24 +78,37 @@ export const getAllServices = async (req, res, next) => {
     // Inactive services are hidden from public users.
     // Only authenticated admins passing status="all" or all="true" can see inactive services.
     const isAdmin = req.user?.role === "admin";
-    if (isAdmin && (status === "all" || all === "true")) {
+    const statusQuery = (status || "").toLowerCase().trim();
+    if (isAdmin && (statusQuery === "all" || all === "true")) {
       // No isActive filter: show all
-    } else if (isAdmin && status === "inactive") {
-      filter.isActive = false;
+    } else if (isAdmin && (statusQuery === "inactive" || req.query.isActive === "false")) {
+      filter.$or = [{ isActive: false }, { status: "inactive" }];
     } else {
-      filter.isActive = true;
+      filter.$or = [
+        { isActive: true },
+        { isActive: { $exists: false }, status: "active" },
+        { isActive: { $exists: false }, status: { $exists: false } },
+      ];
     }
 
-    // Search by name (case-insensitive, multi-keyword search supporting space or +)
+    // Search by name / serviceName (case-insensitive, multi-keyword search supporting space or +)
     if (search && typeof search === "string" && search.trim()) {
       const normalizedSearch = search.replace(/\+/g, " ").trim();
       const words = normalizedSearch.split(/\s+/).filter(Boolean);
+      const makeWordCondition = (w) => ({
+        $or: [
+          { name: { $regex: escapeRegex(w), $options: "i" } },
+          { serviceName: { $regex: escapeRegex(w), $options: "i" } },
+        ],
+      });
       if (words.length === 1) {
-        filter.name = { $regex: escapeRegex(words[0]), $options: "i" };
+        filter.$and = filter.$and || [];
+        filter.$and.push(makeWordCondition(words[0]));
       } else if (words.length > 1) {
-        filter.$and = words.map((w) => ({
-          name: { $regex: escapeRegex(w), $options: "i" },
-        }));
+        filter.$and = filter.$and || [];
+        for (const w of words) {
+          filter.$and.push(makeWordCondition(w));
+        }
       }
     }
 
@@ -157,7 +192,7 @@ export const getAllServices = async (req, res, next) => {
         limit,
         totalPages: Math.ceil(total / limit) || 1,
       },
-      data: services,
+      data: services.map(formatService),
     });
   } catch (error) {
     next(error);
@@ -191,7 +226,8 @@ export const getServiceById = async (req, res, next) => {
 
     // Inactive services are hidden from public users unless requester is an admin
     const isAdmin = req.user?.role === "admin";
-    if (!service.isActive && !isAdmin) {
+    const isServiceActive = service.isActive !== false && service.status !== "inactive";
+    if (!isServiceActive && !isAdmin) {
       return res.status(404).json({
         success: false,
         message: "Service not found or is currently unavailable",
@@ -200,7 +236,7 @@ export const getServiceById = async (req, res, next) => {
 
     res.status(200).json({
       success: true,
-      data: service,
+      data: formatService(service),
     });
   } catch (error) {
     next(error);
@@ -215,6 +251,7 @@ export const createService = async (req, res, next) => {
   try {
     const {
       name,
+      serviceName,
       slug: customSlug,
       description,
       shortDescription,
@@ -223,29 +260,32 @@ export const createService = async (req, res, next) => {
       duration,
       image,
       isActive,
+      status,
     } = req.body;
 
-    // Validate required fields
-    if (!name || typeof name !== "string" || name.trim().length < 2) {
+    // Validate required fields (supports name or serviceName)
+    const effectiveName = (typeof serviceName === "string" && serviceName.trim())
+      ? serviceName.trim()
+      : (typeof name === "string" ? name.trim() : "");
+
+    if (!effectiveName || effectiveName.length < 2) {
       return res.status(400).json({
         success: false,
         message: "Service name is required (minimum 2 characters)",
       });
     }
 
-    if (!description || typeof description !== "string" || description.trim().length < 5) {
-      return res.status(400).json({
-        success: false,
-        message: "Service description is required (minimum 5 characters)",
-      });
-    }
+    const effectiveDescription =
+      typeof description === "string" && description.trim().length >= 5
+        ? description.trim()
+        : typeof shortDescription === "string" && shortDescription.trim().length >= 5
+        ? shortDescription.trim()
+        : `${effectiveName} treatment and salon care service`;
 
-    if (!category || typeof category !== "string" || category.trim().length < 2) {
-      return res.status(400).json({
-        success: false,
-        message: "Service category is required",
-      });
-    }
+    const effectiveCategory =
+      typeof category === "string" && category.trim().length >= 2
+        ? category.trim()
+        : "General";
 
     const numPrice = Number(price);
     if (price === undefined || isNaN(numPrice) || numPrice < 0) {
@@ -266,7 +306,7 @@ export const createService = async (req, res, next) => {
     // Determine slug
     const generatedSlug = customSlug && typeof customSlug === "string"
       ? slugify(customSlug)
-      : slugify(name);
+      : slugify(effectiveName);
 
     if (!generatedSlug) {
       return res.status(400).json({
@@ -286,19 +326,29 @@ export const createService = async (req, res, next) => {
       });
     }
 
+    // Determine active state (supports isActive boolean or status "active"|"inactive")
+    let activeFlag = true;
+    if (typeof isActive === "boolean") {
+      activeFlag = isActive;
+    } else if (typeof status === "string") {
+      activeFlag = status.toLowerCase().trim() === "active";
+    }
+
     const now = new Date();
     const newService = {
-      name: name.trim(),
+      name: effectiveName,
+      serviceName: effectiveName,
       slug: generatedSlug,
-      description: description.trim(),
+      description: effectiveDescription,
       shortDescription: shortDescription && typeof shortDescription === "string"
         ? shortDescription.trim()
         : "",
-      category: category.trim(),
+      category: effectiveCategory,
       price: numPrice,
       duration: numDuration,
       image: image && typeof image === "string" ? image.trim() : "",
-      isActive: typeof isActive === "boolean" ? isActive : true,
+      isActive: activeFlag,
+      status: activeFlag ? "active" : "inactive",
       createdAt: now,
       updatedAt: now,
     };
@@ -308,10 +358,10 @@ export const createService = async (req, res, next) => {
     res.status(201).json({
       success: true,
       message: "Service created successfully",
-      data: {
+      data: formatService({
         _id: result.insertedId,
         ...newService,
-      },
+      }),
     });
   } catch (error) {
     if (error.code === 11000) {
@@ -351,6 +401,7 @@ export const updateService = async (req, res, next) => {
 
     const {
       name,
+      serviceName,
       slug: customSlug,
       description,
       shortDescription,
@@ -359,18 +410,21 @@ export const updateService = async (req, res, next) => {
       duration,
       image,
       isActive,
+      status,
     } = req.body;
 
     const updates = {};
 
-    if (name !== undefined) {
-      if (typeof name !== "string" || name.trim().length < 2) {
+    const inputName = serviceName !== undefined ? serviceName : name;
+    if (inputName !== undefined) {
+      if (typeof inputName !== "string" || inputName.trim().length < 2) {
         return res.status(400).json({
           success: false,
           message: "Service name must be at least 2 characters",
         });
       }
-      updates.name = name.trim();
+      updates.name = inputName.trim();
+      updates.serviceName = inputName.trim();
     }
 
     if (description !== undefined) {
@@ -423,7 +477,25 @@ export const updateService = async (req, res, next) => {
       updates.image = typeof image === "string" ? image.trim() : "";
     }
 
-    if (isActive !== undefined) {
+    if (status !== undefined) {
+      if (typeof status === "string") {
+        const s = status.toLowerCase().trim();
+        if (s === "active" || s === "inactive") {
+          updates.status = s;
+          updates.isActive = s === "active";
+        } else {
+          return res.status(400).json({
+            success: false,
+            message: "Status must be either 'active' or 'inactive'",
+          });
+        }
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: "Status must be a string ('active' or 'inactive')",
+        });
+      }
+    } else if (isActive !== undefined) {
       if (typeof isActive !== "boolean") {
         return res.status(400).json({
           success: false,
@@ -431,11 +503,13 @@ export const updateService = async (req, res, next) => {
         });
       }
       updates.isActive = isActive;
+      updates.status = isActive ? "active" : "inactive";
     }
 
     // Slug management: if customSlug is provided or name changed, check uniqueness
-    if (customSlug !== undefined || (name !== undefined && name.trim() !== existing.name)) {
-      const targetSlug = customSlug ? slugify(customSlug) : slugify(name);
+    const currentName = existing.name || existing.serviceName;
+    if (customSlug !== undefined || (inputName !== undefined && inputName.trim() !== currentName)) {
+      const targetSlug = customSlug ? slugify(customSlug) : slugify(inputName);
 
       if (!targetSlug) {
         return res.status(400).json({
@@ -480,7 +554,7 @@ export const updateService = async (req, res, next) => {
     res.status(200).json({
       success: true,
       message: "Service updated successfully",
-      data: updatedService,
+      data: formatService(updatedService),
     });
   } catch (error) {
     if (error.code === 11000) {
@@ -496,11 +570,12 @@ export const updateService = async (req, res, next) => {
 /**
  * PATCH /api/services/:id/status (Admin Only)
  * Toggles or updates the active status of a service.
+ * Supports status ("active" | "inactive") or isActive (boolean).
  */
 export const updateServiceStatus = async (req, res, next) => {
   try {
     const { id } = req.params;
-    const { isActive } = req.body;
+    const { isActive, status } = req.body;
 
     if (!ObjectId.isValid(id)) {
       return res.status(400).json({
@@ -509,10 +584,23 @@ export const updateServiceStatus = async (req, res, next) => {
       });
     }
 
-    if (typeof isActive !== "boolean") {
+    let newActiveState;
+    if (typeof status === "string") {
+      const s = status.toLowerCase().trim();
+      if (s === "active") newActiveState = true;
+      else if (s === "inactive") newActiveState = false;
+      else {
+        return res.status(400).json({
+          success: false,
+          message: "Status must be either 'active' or 'inactive'",
+        });
+      }
+    } else if (typeof isActive === "boolean") {
+      newActiveState = isActive;
+    } else {
       return res.status(400).json({
         success: false,
-        message: "isActive must be a boolean value (true or false)",
+        message: "Please provide either status ('active' | 'inactive') or isActive (boolean)",
       });
     }
 
@@ -530,7 +618,8 @@ export const updateServiceStatus = async (req, res, next) => {
       { _id: new ObjectId(id) },
       {
         $set: {
-          isActive,
+          isActive: newActiveState,
+          status: newActiveState ? "active" : "inactive",
           updatedAt: new Date(),
         },
       }
@@ -540,8 +629,8 @@ export const updateServiceStatus = async (req, res, next) => {
 
     res.status(200).json({
       success: true,
-      message: `Service ${isActive ? "activated" : "deactivated"} successfully`,
-      data: updatedService,
+      message: `Service ${newActiveState ? "activated" : "deactivated"} successfully`,
+      data: formatService(updatedService),
     });
   } catch (error) {
     next(error);

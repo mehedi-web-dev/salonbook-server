@@ -693,6 +693,103 @@ export const handleStripeWebhook = async (req, res, next) => {
       });
     }
 
+    // Handle checkout session expiration (customer abandoned or did not complete checkout)
+    if (event.type === "checkout.session.expired") {
+      const session = event.data.object;
+      const appointmentId = session.metadata?.appointmentId;
+      const customerId = session.metadata?.customerId;
+
+      // Event idempotency check
+      const eventRecorded = await webhookEventsCollection.findOne({ _id: event.id });
+      if (eventRecorded) {
+        return res.status(200).json({ received: true, message: "Event already processed" });
+      }
+
+      // Check if this session was already paid (do NOT downgrade a paid transaction to expired/failed)
+      const existingSessionTx = await transactionsCollection.findOne({ stripeSessionId: session.id });
+      if (existingSessionTx && existingSessionTx.status === "paid") {
+        return res.status(200).json({
+          received: true,
+          message: "Payment already completed successfully; ignoring stale expiration event",
+        });
+      }
+
+      // Check if this session is in reconciliation_required (do NOT degrade or modify reconciliation state)
+      if (existingSessionTx && existingSessionTx.status === "reconciliation_required") {
+        return res.status(200).json({
+          received: true,
+          reconciliation: true,
+          status: "reconciliation_required",
+          message: "Transaction remains in reconciliation; ignoring expiration event",
+        });
+      }
+
+      const mongoSession = client.startSession();
+      try {
+        await mongoSession.withTransaction(async () => {
+          await webhookEventsCollection.insertOne(
+            {
+              _id: event.id,
+              type: event.type,
+              sessionId: session.id,
+              createdAt: new Date(),
+            },
+            { session: mongoSession }
+          );
+
+          if (!existingSessionTx && appointmentId && ObjectId.isValid(appointmentId)) {
+            await transactionsCollection.insertOne(
+              {
+                appointmentId: new ObjectId(appointmentId),
+                customerId: customerId && ObjectId.isValid(customerId) ? new ObjectId(customerId) : null,
+                stripeSessionId: session.id,
+                stripePaymentIntentId:
+                  typeof session.payment_intent === "string" ? session.payment_intent : null,
+                stripeEventId: event.id,
+                amount: Number(session.metadata?.servicePrice) || 0,
+                currency: session.currency || "usd",
+                status: "failed",
+                paymentMethod: session.payment_method_types?.[0] || "card",
+                notes: "Checkout session expired before completion.",
+                createdAt: new Date(),
+                updatedAt: new Date(),
+              },
+              { session: mongoSession }
+            );
+          } else if (
+            existingSessionTx &&
+            existingSessionTx.status !== "paid" &&
+            existingSessionTx.status !== "reconciliation_required"
+          ) {
+            await transactionsCollection.updateOne(
+              { _id: existingSessionTx._id },
+              {
+                $set: {
+                  notes: existingSessionTx.notes
+                    ? `${existingSessionTx.notes} Checkout session expired.`
+                    : "Checkout session expired.",
+                  updatedAt: new Date(),
+                },
+              },
+              { session: mongoSession }
+            );
+          }
+        });
+      } catch (err) {
+        if (err.code !== 11000) {
+          console.error("[Stripe Webhook] Session expiration recording error:", err.message);
+          throw err;
+        }
+      } finally {
+        await mongoSession.endSession();
+      }
+
+      return res.status(200).json({
+        received: true,
+        status: "expired",
+      });
+    }
+
     // Acknowledge receipt for unhandled events
     return res.status(200).json({
       received: true,

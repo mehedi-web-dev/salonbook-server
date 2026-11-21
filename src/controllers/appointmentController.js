@@ -167,7 +167,8 @@ export const createAppointment = async (req, res, next) => {
       });
     }
 
-    if (!service.isActive) {
+    const isServiceActive = service.isActive !== undefined ? service.isActive : service.status === "active";
+    if (!isServiceActive) {
       return res.status(400).json({
         success: false,
         message: "This salon service is currently unavailable for booking",
