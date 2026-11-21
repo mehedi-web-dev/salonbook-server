@@ -1,3 +1,4 @@
+import "dotenv/config";
 import { betterAuth } from "better-auth";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { jwt } from "better-auth/plugins";
@@ -38,6 +39,53 @@ export const checkAndPromoteAdmin = async (user) => {
   return user;
 };
 
+/**
+ * Safely resolves social providers configuration from environment variables.
+ * Returns provider map and diagnostic status without exposing secrets.
+ */
+export const resolveGoogleProviderConfig = (env = process.env) => {
+  const clientId = env.GOOGLE_CLIENT_ID?.trim();
+  const clientSecret = env.GOOGLE_CLIENT_SECRET?.trim();
+  const isPlaceholderSecret =
+    clientSecret === "your_google_client_secret" ||
+    clientSecret === "your_client_secret";
+
+  const isConfigured = Boolean(clientId && clientSecret && !isPlaceholderSecret);
+  const missing = [];
+  if (!clientId) missing.push("GOOGLE_CLIENT_ID");
+  if (!clientSecret) missing.push("GOOGLE_CLIENT_SECRET");
+  else if (isPlaceholderSecret) missing.push("GOOGLE_CLIENT_SECRET (placeholder detected)");
+
+  return {
+    isConfigured,
+    missing,
+    provider: isConfigured
+      ? {
+          google: {
+            clientId,
+            clientSecret,
+          },
+        }
+      : {},
+  };
+};
+
+const googleConfig = resolveGoogleProviderConfig(process.env);
+
+if (googleConfig.isConfigured) {
+  if (process.env.NODE_ENV !== "test") {
+    console.log("[Better Auth] Google OAuth provider registered successfully.");
+  }
+} else {
+  if (process.env.NODE_ENV !== "test") {
+    console.warn(
+      `[Better Auth] Google OAuth provider disabled: Missing or invalid environment variable(s): ${googleConfig.missing.join(
+        ", "
+      )}. Sign-ins using Google will fail with 'Provider not found'.`
+    );
+  }
+}
+
 export const auth = betterAuth({
   database: mongodbAdapter(db, {
     client,
@@ -50,14 +98,7 @@ export const auth = betterAuth({
     minPasswordLength: 6,
   },
   socialProviders: {
-    ...(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET
-      ? {
-          google: {
-            clientId: process.env.GOOGLE_CLIENT_ID,
-            clientSecret: process.env.GOOGLE_CLIENT_SECRET,
-          },
-        }
-      : {}),
+    ...googleConfig.provider,
   },
   user: {
     additionalFields: {
