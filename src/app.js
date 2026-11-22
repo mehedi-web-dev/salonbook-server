@@ -27,6 +27,7 @@ app.use(helmet());
 // CORS configuration
 const allowedOrigins = [
   "https://salonbook-virid.vercel.app",
+  "https://salonbook-server-roan.vercel.app",
   "http://localhost:3000",
   "http://localhost:5000",
   "http://127.0.0.1:3000",

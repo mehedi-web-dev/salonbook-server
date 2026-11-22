@@ -8,6 +8,7 @@ const PRODUCTION_FRONTEND = "https://salonbook-virid.vercel.app";
 
 const trustedOrigins = [
   PRODUCTION_FRONTEND,
+  "https://salonbook-server-roan.vercel.app",
   "http://localhost:3000",
   "http://localhost:5000",
   "http://127.0.0.1:3000",
@@ -87,18 +88,58 @@ if (googleConfig.isConfigured) {
 }
 
 /**
- * Safely normalizes Better Auth base URL, stripping trailing slashes and correcting common domain typos.
+ * Safely resolves the Better Auth base URL for OAuth callbacks and public endpoints.
+ * In production:
+ *   - Defaults to the canonical frontend origin (PRODUCTION_FRONTEND) to support same-origin proxying via Next.js.
+ *   - Normalizes trailing slashes and corrects domain typos.
+ *   - Emits a diagnostic warning if BETTER_AUTH_URL is set to the backend domain rather than the frontend proxy.
+ * In local development:
+ *   - Defaults to http://localhost:5000.
  */
-export const getAuthBaseUrl = () => {
-  let url = process.env.BETTER_AUTH_URL?.trim();
-  if (!url) return "http://localhost:5000";
+export const getAuthBaseUrl = (env = process.env) => {
+  const isProduction =
+    env.NODE_ENV === "production" ||
+    env.VERCEL === "1" ||
+    Boolean(env.VERCEL_ENV && env.VERCEL_ENV !== "development");
+
+  let url = env.BETTER_AUTH_URL?.trim();
+
+  // If unset, default safely based on environment
+  if (!url) {
+    if (isProduction) {
+      if (env.NODE_ENV !== "test") {
+        console.warn(
+          `[Better Auth] BETTER_AUTH_URL is not set in production. Defaulting to canonical frontend origin: ${PRODUCTION_FRONTEND}`
+        );
+      }
+      return PRODUCTION_FRONTEND;
+    }
+    return "http://localhost:5000";
+  }
+
+  // Normalize trailing slashes
   url = url.replace(/\/+$/, "");
+
+  // Domain typo normalization
   if (url.endsWith(".vercel.ap")) {
-    console.warn(
-      `[Better Auth] Detected typo in BETTER_AUTH_URL ('${url}'). Normalizing to '${url}p'. Please update BETTER_AUTH_URL in Vercel settings.`
-    );
+    if (env.NODE_ENV !== "test") {
+      console.warn(
+        `[Better Auth] Detected typo in BETTER_AUTH_URL ('${url}'). Normalizing to '${url}p'. Please update BETTER_AUTH_URL in Vercel settings.`
+      );
+    }
     url = `${url}p`;
   }
+
+  // If in production on Vercel and pointing to backend URL instead of frontend proxy, route to frontend and notify
+  if (isProduction && url.includes("salonbook-server-roan.vercel.app")) {
+    if (env.NODE_ENV !== "test") {
+      console.warn(
+        `[Better Auth] Notice: BETTER_AUTH_URL is set to backend domain ('${url}'). For same-origin proxy authentication, public OAuth callbacks are routed through frontend origin: ${PRODUCTION_FRONTEND}.`
+      );
+    }
+    return PRODUCTION_FRONTEND;
+  }
+
   return url;
 };
 
@@ -174,7 +215,7 @@ export const auth = betterAuth({
     defaultCookieAttributes: {
       httpOnly: true,
       secure: isProd,
-      sameSite: isProd ? "none" : "lax",
+      sameSite: "lax",
       path: "/",
     },
     cookies: {
@@ -182,7 +223,7 @@ export const auth = betterAuth({
         attributes: {
           httpOnly: true,
           secure: isProd,
-          sameSite: isProd ? "none" : "lax",
+          sameSite: "lax",
           path: "/",
         },
       },
@@ -190,7 +231,7 @@ export const auth = betterAuth({
         attributes: {
           httpOnly: true,
           secure: isProd,
-          sameSite: isProd ? "none" : "lax",
+          sameSite: "lax",
           path: "/",
         },
       },
