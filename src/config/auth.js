@@ -86,11 +86,29 @@ if (googleConfig.isConfigured) {
   }
 }
 
+/**
+ * Safely normalizes Better Auth base URL, stripping trailing slashes and correcting common domain typos.
+ */
+export const getAuthBaseUrl = () => {
+  let url = process.env.BETTER_AUTH_URL?.trim();
+  if (!url) return "http://localhost:5000";
+  url = url.replace(/\/+$/, "");
+  if (url.endsWith(".vercel.ap")) {
+    console.warn(
+      `[Better Auth] Detected typo in BETTER_AUTH_URL ('${url}'). Normalizing to '${url}p'. Please update BETTER_AUTH_URL in Vercel settings.`
+    );
+    url = `${url}p`;
+  }
+  return url;
+};
+
+const authBaseUrl = getAuthBaseUrl();
+
 export const auth = betterAuth({
   database: mongodbAdapter(db, {
     client,
   }),
-  baseURL: process.env.BETTER_AUTH_URL || "http://localhost:5000",
+  baseURL: authBaseUrl,
   secret: process.env.BETTER_AUTH_SECRET || "salonbook-dev-fallback-secret-at-least-32-chars",
   trustedOrigins,
   emailAndPassword: {
@@ -159,7 +177,7 @@ export const auth = betterAuth({
         },
       },
       jwt: {
-        issuer: process.env.BETTER_AUTH_URL || "http://localhost:5000",
+        issuer: authBaseUrl,
         audience: frontendOrigin,
         expirationTime: "15m",
         definePayload: ({ user }) => ({
