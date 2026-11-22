@@ -160,12 +160,37 @@ export const isProductionEnvironment = (env = process.env, baseUrl = authBaseUrl
 
 const isProd = isProductionEnvironment();
 
+/**
+ * Safely validates and retrieves BETTER_AUTH_SECRET from environment variables.
+ * Enforces minimum length of 32 characters and forbids insecure hardcoded fallbacks.
+ * Never prints, logs, or exposes the secret or any derived value.
+ */
+export const getValidatedAuthSecret = (env = process.env) => {
+  const secret = env.BETTER_AUTH_SECRET?.trim();
+  if (!secret) {
+    throw new Error(
+      "[Better Auth Configuration Error] BETTER_AUTH_SECRET is required but not set in environment variables. Please configure a secure secret (at least 32 characters) in your environment."
+    );
+  }
+  if (secret.length < 32) {
+    throw new Error(
+      `[Better Auth Configuration Error] BETTER_AUTH_SECRET is too short (${secret.length} characters). Better Auth requires a secret of at least 32 characters.`
+    );
+  }
+  if (secret === "salonbook-dev-fallback-secret-at-least-32-chars") {
+    throw new Error(
+      "[Better Auth Configuration Error] Insecure development fallback secret detected in BETTER_AUTH_SECRET. Please configure a distinct, high-entropy secret of at least 32 characters."
+    );
+  }
+  return secret;
+};
+
 export const auth = betterAuth({
   database: mongodbAdapter(db, {
     client,
   }),
   baseURL: authBaseUrl,
-  secret: process.env.BETTER_AUTH_SECRET || "salonbook-dev-fallback-secret-at-least-32-chars",
+  secret: getValidatedAuthSecret(),
   trustedOrigins,
   emailAndPassword: {
     enabled: true,
