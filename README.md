@@ -1,93 +1,55 @@
-# SalonBook Server
+Prepare the complete Backend README.md content for SalonBook.
 
-The backend REST API server for the SalonBook platform, providing salon service management, appointment booking workflows, and administrative endpoints.
+**Project Path:** `C:\projects\salonbook-server`
 
-## 🛠️ Technology Stack
+**Important:** Do not create or modify any files. I will manually add the README content.
 
-- **Runtime:** Node.js (ESM)
-- **Framework:** Express.js 5
-- **Database:** MongoDB Atlas with Mongoose ODM
-- **Security & Utilities:** Helmet, CORS, Morgan, Dotenv
-- **Deployment Platform:** Vercel (Serverless Functions)
+Inspect the actual backend source code, package.json, API routes, controllers, middleware, MongoDB configuration, Better Auth, JWT verification, Stripe integration, webhook, and ImgBB integration.
 
-## 📁 Project Structure
+Create a complete, professional README.md containing:
 
-```text
-salonbook-server/
-├── api/
-│   └── index.js              # Vercel serverless entrypoint
-├── src/
-│   ├── config/
-│   │   └── db.js             # Mongoose connection with serverless caching
-│   ├── controllers/          # Business logic handlers
-│   ├── middleware/
-│   │   └── errorHandler.js   # Centralized error and 404 handlers
-│   ├── models/               # Mongoose data schemas and models
-│   ├── routes/
-│   │   └── health.js         # Health check and status route
-│   ├── utils/                # Helper utilities
-│   └── app.js                # Express app setup and middleware chain
-├── .env.example              # Safe environment variable template
-├── .gitignore                # Security-first Git exclusion rules
-├── index.js                  # Local development server entrypoint
-├── package.json              # Project scripts and dependencies
-├── vercel.json               # Vercel deployment rewrite rules
-└── README.md                 # Project documentation
-```
+1. Project Overview
+2. Live Backend URL
+3. Frontend Live URL
+4. Key Features
+5. Technology Stack
+6. Project Structure
+7. Database Collections
+8. API Documentation (actual endpoints only)
+9. Authentication and JWT Verification
+10. Role-Based Authorization
+11. Stripe Checkout and Webhook
+12. ImgBB Integration
+13. Installation Instructions
+14. Environment Variables (exact names only)
+15. Local Development Setup
+16. Available npm Scripts
+17. Deployment Instructions
+18. Frontend and Backend GitHub Links
 
-## ⚙️ Environment Configuration
+Repository URLs:
 
-Create a `.env` file in the root directory based on `.env.example`:
+Frontend: https://github.com/mehedi-web-dev/salonbook
 
-```env
-# MongoDB Atlas Connection String
-MONGODB_URI=
+Backend: https://github.com/mehedi-web-dev/salonbook-server
 
-# Server Port (default: 5000)
-PORT=5000
+Live URLs:
 
-# Environment Mode (development | production)
-NODE_ENV=development
+Frontend: https://salonbook-virid.vercel.app/
 
-# Allowed Frontend Client URL (for CORS)
-CLIENT_URL=https://salonbook-virid.vercel.app
-```
+Backend: https://salonbook-server-roan.vercel.app/
 
-> **Note:** Never commit `.env` or any production credentials to version control.
+### Strict Requirements
 
-## 🚀 Installation & Local Development
+- Document only features confirmed in the actual code.
+- Inspect actual environment variable references.
+- Never include real passwords, API keys, tokens, or secrets.
+- Do not invent API endpoints or npm commands.
+- Keep documentation accurate and assignment-focused.
+- Do not modify source code, environment files, Git history, or README.md.
 
-1. **Install dependencies:**
-   ```bash
-   npm install
-   ```
+### Output
 
-2. **Run in development mode (with auto-reload):**
-   ```bash
-   npm run dev
-   ```
+Return the entire README.md content in one Markdown code block so I can copy and paste it manually.
 
-3. **Start production server:**
-   ```bash
-   npm start
-   ```
-
-## 🩺 API Health Endpoint
-
-- **Route:** `GET /api/health`
-- **Description:** Verifies server runtime status, uptime, and database connection state.
-- **Example Response:**
-  ```json
-  {
-    "success": true,
-    "message": "SalonBook API server is healthy",
-    "status": "ok",
-    "timestamp": "2026-11-19T00:30:00.000Z",
-    "uptime": 120,
-    "database": {
-      "status": "connected",
-      "readyState": 1
-    },
-    "environment": "development"
-  }
-  ```
+Afterward, list the exact environment variable names and verified npm commands.
