@@ -104,6 +104,21 @@ export const getAuthBaseUrl = () => {
 
 const authBaseUrl = getAuthBaseUrl();
 
+/**
+ * Determines whether the auth system is operating in a production / secure-cookie environment.
+ * Checks NODE_ENV, Vercel platform indicators, and whether authBaseUrl is HTTPS.
+ */
+export const isProductionEnvironment = (env = process.env, baseUrl = authBaseUrl) => {
+  return (
+    env.NODE_ENV === "production" ||
+    env.VERCEL === "1" ||
+    Boolean(env.VERCEL_ENV && env.VERCEL_ENV !== "development") ||
+    baseUrl.startsWith("https://")
+  );
+};
+
+const isProd = isProductionEnvironment();
+
 export const auth = betterAuth({
   database: mongodbAdapter(db, {
     client,
@@ -155,12 +170,30 @@ export const auth = betterAuth({
     },
   },
   advanced: {
-    useSecureCookies: process.env.NODE_ENV === "production",
+    useSecureCookies: isProd,
     defaultCookieAttributes: {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
+      secure: isProd,
+      sameSite: isProd ? "none" : "lax",
       path: "/",
+    },
+    cookies: {
+      state: {
+        attributes: {
+          httpOnly: true,
+          secure: isProd,
+          sameSite: isProd ? "none" : "lax",
+          path: "/",
+        },
+      },
+      oauth_state: {
+        attributes: {
+          httpOnly: true,
+          secure: isProd,
+          sameSite: isProd ? "none" : "lax",
+          path: "/",
+        },
+      },
     },
   },
   rateLimit: {
