@@ -162,9 +162,13 @@ export const createCheckoutSession = async (req, res, next) => {
     }
 
     // Avoid creating redundant multiple sessions for the same unpaid appointment if an open session exists
-    if (appointment.stripeSessionId) {
+    let activeSessionId = appointment.stripeSessionId;
+    let paymentAttempt = appointment.paymentAttempt || 1;
+    let referenceTime = appointment.updatedAt instanceof Date ? appointment.updatedAt.getTime() : Date.now();
+
+    if (activeSessionId) {
       try {
-        const existingSession = await stripe.checkout.sessions.retrieve(appointment.stripeSessionId);
+        const existingSession = await stripe.checkout.sessions.retrieve(activeSessionId);
         if (existingSession && existingSession.status === "open" && existingSession.url) {
           return res.status(200).json({
             success: true,
@@ -175,13 +179,41 @@ export const createCheckoutSession = async (req, res, next) => {
             },
           });
         }
+        // If existing session is expired or closed, advance payment attempt atomically
+        const updated = await appointmentsCollection.findOneAndUpdate(
+          { _id: appointment._id, stripeSessionId: activeSessionId },
+          {
+            $inc: { paymentAttempt: 1 },
+            $set: { updatedAt: new Date() },
+            $unset: { stripeSessionId: "" },
+          },
+          { returnDocument: "after" }
+        );
+        if (updated) {
+          paymentAttempt = updated.paymentAttempt || (paymentAttempt + 1);
+          referenceTime = updated.updatedAt instanceof Date ? updated.updatedAt.getTime() : Date.now();
+        }
       } catch (retrieveErr) {
-        // Session expired or invalid, proceed to create a new session
+        // Session retrieve error, advance payment attempt safely
+        const updated = await appointmentsCollection.findOneAndUpdate(
+          { _id: appointment._id },
+          {
+            $inc: { paymentAttempt: 1 },
+            $set: { updatedAt: new Date() },
+            $unset: { stripeSessionId: "" },
+          },
+          { returnDocument: "after" }
+        );
+        if (updated) {
+          paymentAttempt = updated.paymentAttempt || (paymentAttempt + 1);
+          referenceTime = updated.updatedAt instanceof Date ? updated.updatedAt.getTime() : Date.now();
+        }
       }
     }
 
     const frontendUrl = getFrontendUrl();
-    const idempotencyTimestamp = appointment.updatedAt instanceof Date ? appointment.updatedAt.getTime() : Date.now();
+    // Versioned idempotency namespace: cs_v2 prevents collision with historical keys sent with deprecated parameters
+    const idempotencyKey = `cs_v2_${appointment._id}_att${paymentAttempt}_${referenceTime}`;
 
     const session = await stripe.checkout.sessions.create(
       {
@@ -213,14 +245,20 @@ export const createCheckoutSession = async (req, res, next) => {
         cancel_url: `${frontendUrl}/appointments/${appointment._id}?payment=cancelled`,
       },
       {
-        idempotencyKey: `cs_${appointment._id}_${idempotencyTimestamp}`,
+        idempotencyKey,
       }
     );
 
-    // Save Stripe session ID to appointment record (without marking paymentStatus as paid)
+    // Save Stripe session ID and idempotency key to appointment record (without marking paymentStatus as paid)
     await appointmentsCollection.updateOne(
       { _id: appointment._id },
-      { $set: { stripeSessionId: session.id } }
+      {
+        $set: {
+          stripeSessionId: session.id,
+          stripeIdempotencyKey: idempotencyKey,
+          paymentAttempt,
+        },
+      }
     );
 
     return res.status(200).json({

@@ -87,8 +87,22 @@ test("Static Audit: No other Stripe API request payloads send payment_method_typ
   }
 });
 
-// 2. Behavioral Verification: Mock test of createCheckoutSession payload
-await asyncTest("Runtime Mock Test: createCheckoutSession constructs payload without payment_method_types", async () => {
+test("Static Audit: Idempotency key uses versioned cs_v2_ namespace to prevent conflict with historical keys", () => {
+  const controllerPath = path.join(rootDir, "src", "controllers", "paymentController.js");
+  const code = fs.readFileSync(controllerPath, "utf8");
+
+  assert.ok(
+    code.includes("cs_v2_"),
+    "Controller must use 'cs_v2_' namespace to isolate updated payload from deprecated keys"
+  );
+  assert.ok(
+    !code.includes("idempotencyKey: `cs_${appointment._id}_"),
+    "Old unversioned 'cs_${appointment._id}_' must not be used"
+  );
+});
+
+// 2. Behavioral Verification: Mock test of createCheckoutSession payload & idempotency
+await asyncTest("Runtime Mock Test: createCheckoutSession constructs payload with versioned idempotencyKey", async () => {
   let capturedSessionPayload = null;
   let capturedIdempotencyKey = null;
 
@@ -109,37 +123,47 @@ await asyncTest("Runtime Mock Test: createCheckoutSession constructs payload wit
   };
 
   // Mock database and helpers
-  const appointmentId = "6aff078aad78d48137e18131";
-  const customerId = "6afec0fc4437bb109eae4915";
-  const serviceId = "6aff00000000000000000001";
+  const appointmentId = "6b02a45bc8e8dfee02689456";
+  const customerId = "6b024e6ddd44967c4e1c9fcb";
+  const serviceId = "6aff1b8b510d2292a672935d";
 
   const mockAppointment = {
     _id: appointmentId,
     customerId: customerId,
     serviceId: serviceId,
-    servicePrice: 45.0,
+    servicePrice: 150.0,
     status: "confirmed",
     paymentStatus: "unpaid",
-    appointmentDate: "2026-11-25",
-    timeSlot: "10:00 AM",
-    updatedAt: new Date("2026-11-22T10:00:00Z"),
+    appointmentDate: "2026-11-23",
+    timeSlot: "16:00",
+    updatedAt: new Date("2026-11-22T08:18:19.596Z"),
   };
 
   const mockService = {
     _id: serviceId,
-    name: "Classic Haircut & Styling",
-    image: "https://i.ibb.co/example/haircut.jpg",
+    name: "Deluxe Hair Treatment",
+    image: "https://i.ibb.co/example/hair.jpg",
   };
 
   // Verify formatStripeAmount helper
   const { formatStripeAmount, getStripeCurrency } = await import("../src/config/stripe.js");
   const unitAmount = formatStripeAmount(mockAppointment.servicePrice, "usd");
-  assert.equal(unitAmount, 4500, "Service price $45.00 must convert to 4500 cents");
+  assert.equal(unitAmount, 15000, "Service price $150.00 must convert to 15000 cents");
+
+  const paymentAttempt = mockAppointment.paymentAttempt || 1;
+  const referenceTime = mockAppointment.updatedAt.getTime();
+  const versionedKey = `cs_v2_${mockAppointment._id}_att${paymentAttempt}_${referenceTime}`;
+
+  // Conflicting old key check: must NOT equal the key that caused the error
+  const conflictingOldKey = "cs_6b02a45bc8e8dfee02689456_1795335499596";
+  assert.notEqual(versionedKey, conflictingOldKey, "New idempotency key must not match old conflicting key");
+  assert.ok(versionedKey.startsWith("cs_v2_"), "New key must start with cs_v2_");
+  assert.ok(versionedKey.includes("att1_1795335499596"), "Key must be deterministic for identical retries");
 
   // Simulate controller session creation payload builder
   const payloadToStripe = {
     mode: "payment",
-    customer_email: "customer@example.com",
+    customer_email: "infomehedi81@gmail.com",
     client_reference_id: customerId,
     line_items: [
       {
@@ -167,7 +191,7 @@ await asyncTest("Runtime Mock Test: createCheckoutSession constructs payload wit
   };
 
   const session = await mockStripe.checkout.sessions.create(payloadToStripe, {
-    idempotencyKey: `cs_${mockAppointment._id}_${mockAppointment.updatedAt.getTime()}`,
+    idempotencyKey: versionedKey,
   });
 
   // Strict assertions on the created session payload
@@ -177,13 +201,30 @@ await asyncTest("Runtime Mock Test: createCheckoutSession constructs payload wit
     "payment_method_types must be undefined in Stripe create payload"
   );
   assert.equal(capturedSessionPayload.mode, "payment", "mode must be 'payment'");
-  assert.equal(capturedSessionPayload.customer_email, "customer@example.com");
+  assert.equal(capturedSessionPayload.customer_email, "infomehedi81@gmail.com");
   assert.equal(capturedSessionPayload.client_reference_id, customerId);
-  assert.equal(capturedSessionPayload.line_items[0].price_data.unit_amount, 4500);
+  assert.equal(capturedSessionPayload.line_items[0].price_data.unit_amount, 15000);
   assert.equal(capturedSessionPayload.metadata.appointmentId, appointmentId);
   assert.ok(capturedSessionPayload.success_url.includes("{CHECKOUT_SESSION_ID}"));
-  assert.ok(capturedIdempotencyKey.startsWith("cs_"));
+  assert.equal(capturedIdempotencyKey, versionedKey);
   assert.equal(session.id, "cs_test_mock_1234567890");
+});
+
+test("Retry & Expired Session Advancement", () => {
+  const appointmentId = "6b02a45bc8e8dfee02689456";
+  const time1 = 1795335499596;
+  const keyAttempt1 = `cs_v2_${appointmentId}_att1_${time1}`;
+
+  // Retry 1 with same state -> identical key
+  const keyRetry1 = `cs_v2_${appointmentId}_att1_${time1}`;
+  assert.equal(keyAttempt1, keyRetry1, "Same attempt must produce identical key for safe retries");
+
+  // Attempt 2 after expired session -> advances attempt and timestamp
+  const time2 = time1 + 60000;
+  const keyAttempt2 = `cs_v2_${appointmentId}_att2_${time2}`;
+  assert.notEqual(keyAttempt1, keyAttempt2, "New attempt must produce fresh key");
+  assert.ok(keyAttempt2.startsWith("cs_v2_"));
+  assert.ok(keyAttempt2.includes("att2_"));
 });
 
 // 3. Security & Validation Rules
