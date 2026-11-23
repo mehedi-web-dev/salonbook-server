@@ -1,7 +1,11 @@
 import express from "express";
 import { requireAdmin, requireAuth } from "../middleware/auth.js";
 import { handleImageUpload } from "../middleware/upload.js";
-import { uploadServiceImage, uploadProfileImage } from "../controllers/uploadController.js";
+import {
+  uploadServiceImage,
+  uploadProfileImage,
+  uploadBarberImage,
+} from "../controllers/uploadController.js";
 
 const router = express.Router();
 
@@ -18,6 +22,21 @@ router.post(
   requireAdmin,
   handleImageUpload,
   uploadServiceImage
+);
+
+/**
+ * Admin-Only Barber Image Upload Route
+ * POST /api/uploads/barber-image
+ *
+ * 1. requireAdmin: Rejects unauthenticated requests (401) and non-admin requests (403)
+ * 2. handleImageUpload: Validates multipart/form-data payload, file format (JPEG/PNG/WebP), and size (<=5MB)
+ * 3. uploadBarberImage: Uploads file buffer to ImgBB and returns hosted URLs
+ */
+router.post(
+  "/barber-image",
+  requireAdmin,
+  handleImageUpload,
+  uploadBarberImage
 );
 
 /**

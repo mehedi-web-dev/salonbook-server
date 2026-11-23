@@ -4,7 +4,7 @@ import path from "node:path";
  * Shared internal helper for uploading image file buffers to ImgBB.
  * Enforces file presence, non-empty buffer, and server configuration.
  */
-const uploadFileToImgBB = async (file) => {
+export const uploadFileToImgBB = async (file) => {
   if (!file) {
     const error = new Error("Image file is required");
     error.statusCode = 400;
@@ -114,6 +114,36 @@ export const uploadProfileImage = async (req, res, next) => {
     }
     const isTimeout = error.name === "TimeoutError" || error.name === "AbortError";
     console.error("[Upload Controller] Profile image upload failed:", error.name, error.message);
+    return res.status(isTimeout ? 504 : 502).json({
+      success: false,
+      message: isTimeout
+        ? "Image upload request timed out"
+        : "Failed to connect to external image upload service",
+    });
+  }
+};
+
+/**
+ * POST /api/uploads/barber-image (Admin Only)
+ * Uploads a barber profile image to ImgBB and returns hosted URLs.
+ */
+export const uploadBarberImage = async (req, res, next) => {
+  try {
+    const data = await uploadFileToImgBB(req.file);
+    return res.status(200).json({
+      success: true,
+      message: "Barber image uploaded successfully",
+      data,
+    });
+  } catch (error) {
+    if (error.statusCode) {
+      return res.status(error.statusCode).json({
+        success: false,
+        message: error.message,
+      });
+    }
+    const isTimeout = error.name === "TimeoutError" || error.name === "AbortError";
+    console.error("[Upload Controller] Barber image upload failed:", error.name, error.message);
     return res.status(isTimeout ? 504 : 502).json({
       success: false,
       message: isTimeout
